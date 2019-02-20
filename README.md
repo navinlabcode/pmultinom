@@ -1,4 +1,12 @@
-`pmultinom` is a library for calculating multinomial probabilities. The probabilities that can be calculated include the multinomial cumulative distribution function:
+`pmultinom` is a library for calculating multinomial probabilities.
+
+To install from CRAN:
+
+```
+install.packages("pmultinom")
+```
+
+The probabilities that can be calculated include the multinomial cumulative distribution function:
 $$P(N_1 \le u_1, N_2 \le u_2, \cdots, N_k \le u_k)$$
 In this case the usage would be
 ```
