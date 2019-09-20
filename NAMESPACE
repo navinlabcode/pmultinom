@@ -2,3 +2,5 @@
 
 export(invert.pmultinom)
 export(pmultinom)
+useDynLib(pmultinom,calculate_correction)
+useDynLib(pmultinom,sequentialNewtonRootR)

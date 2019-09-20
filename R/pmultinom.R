@@ -2,21 +2,6 @@
 # These functions don't check their input; it's up to the user-facing functions
 # to make sure input is sensible
 
-# Convolve function
-# Inspired by "convolve" in the stats package
-fftw.convolve <- function(unpadded.x, unpadded.y, plan)
-{
-  # Assuming without checking that length(x) == length(y)
-  n.in <- length(unpadded.x)
-  n.padded <- 2*length(unpadded.x) - 1
-  x <- c(rep.int(0, n.in - 1), unpadded.x)
-  y <- c(unpadded.y, rep.int(0, n.in - 1))
-  complex.result <- fftw::IFFT(fftw::FFT(x,plan=plan) * Conj(fftw::FFT(y,plan=plan)), plan=plan)
-  # Assume without checking that the input was real and that the output,
-  # therefore, should also be real
-  Re(complex.result)
-}
-
 ## Reference implementation for testing
 reference.cdf <- function(upper, probs, size, method=NULL)
 {
@@ -71,6 +56,70 @@ tpois.pmf <- function(xs, a, b, l)
   }
 }
 
+# Functions to solve P(X1>b1, X2>b2, ... | Lambda1=lambda*p1,
+# Lambda2=lambda*p2, ...) in the Poisson approximation. First, for inverting
+# when there's only one condition, then, for inverting when there's multiple
+# conditions.
+#' @useDynLib pmultinom sequentialNewtonRootR
+invert.equiprobable <- function(n.categories, target.probability, cutoff)
+{
+  # Solve P[X>=cutoff]^n.categories = target.probability, assuming a Poisson
+  # distribution, solving for the Poisson rate
+  qgamma(target.probability^(1/n.categories), shape = cutoff, rate = 1)
+}
+invert.poisson.survival.function <- function(ps, bs, ms, target, eps=10^-2)
+{
+  stopifnot(length(ps) == length(bs) & length(ps) == length(ms))
+  
+  # bs are the highest excluded value
+  # The lowest included value:
+  cs <- bs + 1
+  
+  # Figure out how hard each condition is to satisfy, quantified as how many
+  # individuals it would require
+  indiv.lambdas <- invert.equiprobable(ms, target, cs) / ps
+  
+  # If there's only one condition, this can be solved exactly using R's builtin
+  # functionality for inverting the incomplete gamma function
+  if (length(indiv.lambdas) == 1)
+  {
+    return(indiv.lambdas)
+  }
+  
+  # Sort from hardest to easiest to satisfy
+  ordering <- order(indiv.lambdas, decreasing=TRUE)
+  ps.sorted <- ps[ordering]
+  cs.sorted <- cs[ordering]
+  ms.sorted <- ms[ordering]
+  
+  # Find lambda that achieves the target
+  # C call for sequentially finding Poisson rates to satisfy prefixes of the conditions:
+  ccall <- .C("sequentialNewtonRootR", PACKAGE="pmultinom",
+    npop=length(indiv.lambdas), ps=as.double(ps.sorted),
+    cs=as.integer(cs.sorted), ms = as.integer(ms.sorted),
+    lambdaStart = as.double(indiv.lambdas[ordering[1]]),
+    target=as.double(target), eps=as.double(eps), output=double(1))
+  # And the final result:
+  return(ccall$output)
+}
+# Functions for the Fourier convolution method.  I shortsightedly gave these
+# names like "sum.tpois.pmf" as if there was only one way to calculate that.
+
+# Convolve function
+# Inspired by "convolve" in the stats package
+fftw.convolve <- function(unpadded.x, unpadded.y, plan)
+{
+  # Assuming without checking that length(x) == length(y)
+  n.in <- length(unpadded.x)
+  n.padded <- 2*length(unpadded.x) - 1
+  x <- c(rep.int(0, n.in - 1), unpadded.x)
+  y <- c(unpadded.y, rep.int(0, n.in - 1))
+  complex.result <- fftw::IFFT(fftw::FFT(x,plan=plan) * Conj(fftw::FFT(y,plan=plan)), plan=plan)
+  # Assume without checking that the input was real and that the output,
+  # therefore, should also be real
+  Re(complex.result)
+}
+
 # Probability mass function of the sum of truncated Poisson distributions.
 # Calculated in a pretty naive and general way: calculate the pmfs of the
 # individual truncated Poisson random variables and convolve them.
@@ -104,6 +153,102 @@ prob.between <- function(as, bs, ps, n, sum.pmf, l)
   log.uncond.prob.n <- stats::dpois(n, sum(ls), log=TRUE)
   log.poisson.event.prob <- sum(log(stats::ppois(bs, ls) - stats::ppois(as, ls)))
   return(exp(log.poisson.event.prob + log.cond.prob.n - log.uncond.prob.n))
+}
+
+# Functions for the Edgeworth method
+# Calculate a cumulant of the truncated Poisson distribution
+#' @useDynLib pmultinom calculate_correction
+# This can be like half the computational cost, only gives eleven cumulants,
+# and only seven or so of them accurately, so I need to replace this
+cumulant <- Vectorize(function(lambda, cutoff, cumulant)
+{
+  stopifnot(cumulant <= 11)
+  x <- exp(-lambda + cutoff*log(lambda) - (lgamma(cutoff) + pgamma(lambda, shape=cutoff, rate=1, log=TRUE)))
+  correction <- .C("calculate_correction", PACKAGE="pmultinom",
+     cumulant=as.integer(cumulant), c=as.integer(cutoff),
+     ld=as.double(lambda), x = as.double(x), correction=double(1))$correction
+  return(lambda + correction)
+})
+# Calculate probabilist's Hermite numbers
+# This is a small but significant chunk of the computation time in the
+# Edgeworth approximation calculations, and it can easily be calculated much
+# faster recursively, so that's a to-do
+prob.hermite.number <- function(n)
+{
+  Re((1i)^n * (1/2)*gamma((1/2)*n + 1/2)*2^((1/2)*n)*(1 + (-1)^n)/sqrt(pi))
+}
+# "advance" function from PDQutils
+# Slows it down a lot, so I'll have to find another way to do this
+advance <- function (kms) 
+{
+    current <- kms$current
+    mold <- kms$mold
+    n <- length(current)
+    ords <- 1:(length(current))
+    stopifnot(n == sum(current * ords))
+    sumcur <- n
+    m <- 1
+    is.done <- FALSE
+    while (!is.done) {
+        sumcur <- sumcur - current[m] * m + (m + 1)
+        current[m] <- 0
+        current[m + 1] <- current[m + 1] + 1
+        m <- m + 1
+        is.done <- (sumcur <= n) || (m > mold)
+    }
+    mold <- max(mold, m)
+    current[1] <- n - sumcur
+    retv <- list(current = current, mold = mold)
+    return(retv)
+}
+# PMF for a sum of truncated Poisson distributions, using an Edgeworth
+# expansion. A small but significant fraction of the computation time is
+# within this function, so a lot of this looping should be moved to the C
+# code. Also, this function is misleadingly named. It is not a probability
+# mass function, and in fact only provides the probability mass at the mean.
+tpois.sum.pmf.edgeworth <- function(lambdas, cutoffs, multiplicities, eps=10^-5)
+{
+  combined.mean <- sum(multiplicities * cumulant(lambdas, cutoffs, 1))
+  combined.variance <- sum(multiplicities * cumulant(lambdas, cutoffs, 2))
+  cumulants <- c(0, 1)
+  already.calculated <- 2
+  current <- 3
+  Sn <- numeric(0)
+  coef_vec <- numeric(0)
+  poly_vec <- integer(0)
+  contribution <- 0
+  last.contribution <- 0
+  for (s in 1:1000) {
+    # Calculate the current cumulant
+    current.cumulant.index <- s + 2
+    Sn <- c(Sn,
+        sum(multiplicities * cumulant(lambdas, cutoffs, current.cumulant.index)) /
+        sqrt(combined.variance)^current.cumulant.index
+    )
+    nexterm <- 0
+    kms <- list(mold = 1, current = c(s, rep(0, s - 1)))
+    last.contribution <- contribution
+    contribution <- 0
+    while (kms$mold <= s) {
+      r <- sum(kms$current)
+      coefs <- ((Sn[1:s]/factorial(3:(s + 2)))^kms$current)/factorial(kms$current)
+      coef <- prod(coefs)
+      # Record the coefficient, and the index of the Hermite polynomial it's a
+      # coefficient on
+      coef_vec <- c(coef_vec, coef)
+      poly_vec <- c(poly_vec, s + 2 * r)
+      # Add to the contribution to decide whether to stop
+      contribution <- contribution + coef * prob.hermite.number(s + 2 * r)
+      kms <- advance(kms)
+    }
+    # Decide whether to stop
+    if (s > 4 & abs(contribution) < eps & abs(last.contribution) < eps) break
+    if (s >= 1000) stop("Edgeworth expansion did not converge")
+  }
+  # Calculate the correction
+  correction <- sum(coef_vec * prob.hermite.number(poly_vec))
+  # Calculate the probability
+  (1 / sqrt(combined.variance)) * dnorm(0) * (1 + correction)
 }
 
 ## Exported functions
@@ -180,7 +325,7 @@ prob.between <- function(as, bs, ps, n, sum.pmf, l)
 #' @export
 pmultinom <- function(lower=-Inf, upper=Inf, size, probs, method)
 {
-  if (isTRUE(method != "exact")) stop('Method must be specified. Only available method right now is "exact"')
+  if (!isTRUE(method %in% c("exact", "edgeworth"))) stop('Method must be specified. Only available method right now is "exact"')
   # Checking input
   stopifnot(all(is.numeric(lower) | is.na(lower)))
   stopifnot(all(is.numeric(upper) | is.na(upper)))
@@ -217,27 +362,50 @@ pmultinom <- function(lower=-Inf, upper=Inf, size, probs, method)
   # I do this after checking normalization, because if the probabilities don't
   # normalize, the output is nonsense, no matter what the bounds are
   if (any(is.na(c(lower, upper)))) return(NA)
-  # Current method is to calculate all values from 0 to the largest input size.
-  # An easy optimization would be to skip the ones below the smallest input
-  # size.
-  # The algorithm has a tuning parameter, and for each value of the tuning
-  # parameter, is numerically stable for a range of of input values. Therefore,
-  # the following loop calculates different parts of the path 0:n with different
-  # values of the tuning parameter.
-  a <- 3
-  v <- a
-  n <- v^2 - 1
-  distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
-  path <- prob.between(r.lower, r.upper, r.probs, 0:n, distribution, n)
-  while (n < max(size, na.rm=TRUE))
+
+  # Convolution-based method
+  if (method=="exact")
   {
-    old.n <- n
-    v <- v + a
-    n <- v^2 -1
+    # Current method is to calculate all values from 0 to the largest input size.
+    # An easy optimization would be to skip the ones below the smallest input
+    # size.
+    # The algorithm has a tuning parameter, and for each value of the tuning
+    # parameter, is numerically stable for a range of of input values. Therefore,
+    # the following loop calculates different parts of the path 0:n with different
+    # values of the tuning parameter.
+    a <- 3
+    v <- a
+    n <- v^2 - 1
     distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
-    path <- c(path, prob.between(r.lower, r.upper, r.probs, (old.n+1):n, distribution, n))
+    path <- prob.between(r.lower, r.upper, r.probs, 0:n, distribution, n)
+    while (n < max(size, na.rm=TRUE))
+    {
+      old.n <- n
+      v <- v + a
+      n <- v^2 -1
+      distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
+      path <- c(path, prob.between(r.lower, r.upper, r.probs, (old.n+1):n, distribution, n))
+    }
+    return(path[size+1])
+  } else if (method == "edgeworth")
+  # Method based on an Edgeworth expansion
+  {
+    if (!all(upper == Inf)) stop("Edgeworth expansion only implemented for lower bounds so far")
+    # Need to choose lambda to center the mean of truncated poissons on
+    # "size", to make sure an edgeworth expansion will be good. This requires
+    # solving an equation, and I'm choosing an arbitrary range to search for a
+    # solution in, for now. This needs to be fixed to make it robust
+    poisson.rate <- uniroot(function(x) sum(cumulant(x*probs, lower+1, 1)) - size, lower=(2/3)*size, upper=(4/3)*size)$root
+    exp(
+        # Prior
+        sum(ppois(lower, poisson.rate*probs, lower.tail=FALSE, log=TRUE)) +
+        # Probability of data under hypothesis
+        log(tpois.sum.pmf.edgeworth(poisson.rate*probs,
+            lower+1, rep.int(1,length(probs)))) -
+        # Overall probability of data
+        dpois(size, poisson.rate, log=TRUE)
+    )
   }
-  return(path[size+1])
 }
 
 #' Calculate the sample size such that the probability of a result is a given amount.
@@ -280,7 +448,7 @@ pmultinom <- function(lower=-Inf, upper=Inf, size, probs, method)
 #' @export
 invert.pmultinom <- function(lower=-Inf, upper=Inf, probs, target.prob, method)
 {
-  if (isTRUE(method != "exact")) stop('Method must be specified. Only available method right now is "exact"')
+  if (!isTRUE(method %in% c("exact", "edgeworth"))) stop('Method must be specified. Only available method right now is "exact"')
   # Checking input
   # Check that either the input is a numeric vector (which may include NA values), or it is entirely NA:
   stopifnot(is.numeric(lower) | all(is.na(lower)))
@@ -335,31 +503,76 @@ invert.pmultinom <- function(lower=-Inf, upper=Inf, probs, target.prob, method)
   {
     stop(sprintf("Requiring more than %.3f in a category with probability %.3f will cause an infinite loop", r.lower[causes.infinite.loop][1], r.probs[causes.infinite.loop][1]))
   }
-  # How far to skip ahead on each iteration
-  a <- 3
-  # Generate values up to n=a^2
-  v <- a
-  n <- v^2
-  distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
-  path <- prob.between(r.lower, r.upper, r.probs, 0:n, distribution, n)
-  while ((increasing & path[length(path)] < max(target.prob, na.rm=TRUE)) |
-         !increasing & path[length(path)] > min(target.prob, na.rm=TRUE))
+
+  if (method == "exact")
   {
-    # Increment n, repeat
-    old.n <- n
-    v <- v + a
-    n <- v^2 - 1
+    # How far to skip ahead on each iteration
+    a <- 3
+    # Generate values up to n=a^2
+    v <- a
+    n <- v^2
     distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
-    # Calculate the probability of exceeding bs
-    #path <- c(path, prob.greater(bs, freqs, (old.n+1):n, distribution, n))
-    path <- c(path, prob.between(r.lower, r.upper, r.probs, (old.n+1):n, distribution, n))
-  }
-  # The index of the path where the condition is first satisfied
-  index.condition.satisfied <-
-    sapply(target.prob, function(tp)
-      which(increasing & path >= tp |
-           !increasing & path <= tp)[1])
-  # R is one-indexed, so an index of 1 represents a sample size of 0
-  sample.size.condition.satisfied <- index.condition.satisfied - 1
-  return(sample.size.condition.satisfied)
+    path <- prob.between(r.lower, r.upper, r.probs, 0:n, distribution, n)
+    while ((increasing & path[length(path)] < max(target.prob, na.rm=TRUE)) |
+           !increasing & path[length(path)] > min(target.prob, na.rm=TRUE))
+    {
+      # Increment n, repeat
+      old.n <- n
+      v <- v + a
+      n <- v^2 - 1
+      distribution <- sum.tpois.pmf(r.lower, r.upper, n * r.probs, n)
+      # Calculate the probability of exceeding bs
+      #path <- c(path, prob.greater(bs, freqs, (old.n+1):n, distribution, n))
+      path <- c(path, prob.between(r.lower, r.upper, r.probs, (old.n+1):n, distribution, n))
+    }
+    # The index of the path where the condition is first satisfied
+    index.condition.satisfied <-
+      sapply(target.prob, function(tp)
+        which(increasing & path >= tp |
+             !increasing & path <= tp)[1])
+    # R is one-indexed, so an index of 1 represents a sample size of 0
+    sample.size.condition.satisfied <- index.condition.satisfied - 1
+    return(sample.size.condition.satisfied)
+    } else if (method == "edgeworth")
+    {
+      if (!all(upper == Inf)) stop("Edgeworth expansion only implemented for lower bounds so far")
+      # Find a starting value by inverting an approximation If you try
+      # putting negative numbers in this it will crash your R session, so
+      # the input has to be filtered, which shouldn't change the answer
+      # since those conditions are automatically satisfied anyway
+      starting.value <-
+          invert.poisson.survival.function(probs[lower>=0], lower[lower>=0], rep.int(1, length(probs))[lower>=0], target.prob, eps=10^-2)
+      # Newton-raphson rootfinding
+      # This uses way more function values than necessary, so either hte
+      # algorithm should be modified, or the closure should be memoized
+      current.in <- round(starting.value)
+      prob.closure <- function(l) pmultinom(lower=lower, probs=probs, size=l, method="edgeworth")
+      while (TRUE)
+      {
+        current.out <- prob.closure(current.in) - target.prob
+        below <- prob.closure(current.in - 1) - target.prob
+        above <- prob.closure(current.in + 1) - target.prob
+        
+        if ((current.out > 0 & below < 0)
+            | current.out == 0) break
+        
+        derivative <- (above - below) / 2
+        
+        next.in <- round(current.in - current.out / derivative)
+        if (next.in == current.in)
+        {
+          if (current.out < 0)
+          {
+            current.in <- current.in + 1
+          } else
+          {
+            current.in <- current.in - 1
+          }
+        } else
+        {
+          current.in <- next.in
+        }
+      }
+      return(current.in)
+    }
 }
