@@ -395,7 +395,7 @@ pmultinom <- function(lower=-Inf, upper=Inf, size, probs, method)
     # "size", to make sure an edgeworth expansion will be good. This requires
     # solving an equation, and I'm choosing an arbitrary range to search for a
     # solution in, for now. This needs to be fixed to make it robust
-    poisson.rate <- uniroot(function(x) sum(cumulant(x*probs, lower+1, 1)) - size, lower=(2/3)*size, upper=(4/3)*size)$root
+    poisson.rate <- uniroot(function(x) sum(cumulant(x*probs, lower+1, 1)) - size, lower=0, upper=size)$root
     exp(
         # Prior
         sum(ppois(lower, poisson.rate*probs, lower.tail=FALSE, log=TRUE)) +
