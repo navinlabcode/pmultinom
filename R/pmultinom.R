@@ -399,7 +399,6 @@ pmultinom <- function(lower=-Inf, upper=Inf, size, probs, method)
     # solving an equation, and I'm choosing an arbitrary range to search for a
     # solution in, for now. This needs to be fixed to make it robust
     poisson.rate <- uniroot(function(x) sum(cumulant(x*probs, lower+1, 1)) - size, lower=0, upper=2*size)$root
-    print(sprintf("poisson rate: %.3f", poisson.rate))
     exp(
         # Prior
         sum(ppois(lower, poisson.rate*probs, lower.tail=FALSE, log=TRUE)) +
